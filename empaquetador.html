@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Empaquetador de assets — FNAF Noche 6 web</title>
+<style>
+  body { background: #0b0b0b; color: #ddd; font: 16px/1.5 Consolas, "Courier New", monospace; max-width: 760px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 22px; color: #fff; }
+  .box { border: 1px solid #444; padding: 16px; margin: 16px 0; background: #141414; }
+  button, label.btn { background: #2b2b2b; color: #fff; border: 1px solid #777; padding: 10px 16px; font: inherit; cursor: pointer; display: inline-block; }
+  button:hover, label.btn:hover { background: #3a3a3a; }
+  input[type=file] { display: none; }
+  #bar { height: 16px; border: 1px solid #666; margin: 10px 0; } #bar div { height: 100%; width: 0; background: #ccc; }
+  #log { white-space: pre-wrap; color: #aaa; font-size: 14px; }
+  .ok { color: #8f8; } .err { color: #f77; }
+  #out a { display: block; margin: 6px 0; color: #9cf; }
+</style>
+</head>
+<body>
+<h1>Empaquetador de assets</h1>
+<p>Convierte tus assets (el <b>.rar</b> o la carpeta ya descomprimida) en unos pocos archivos <b>fnaf-assets-N.pak</b> de menos de 25 MB.
+Luego subes a GitHub solo: <code>index.html</code>, <code>style.css</code>, <code>assets.js</code>, <code>game.js</code> y los <code>.pak</code>, todo de una vez.</p>
+
+<div class="box">
+  <b>1.</b> Elige tus assets:<br><br>
+  <label class="btn" for="rar">Elegir el archivo .rar</label>
+  &nbsp;o&nbsp;
+  <label class="btn" for="dir">Elegir la carpeta descomprimida</label>
+  <input type="file" id="rar" accept=".rar">
+  <input type="file" id="dir" webkitdirectory directory multiple>
+  <div id="bar"><div></div></div>
+  <div id="log">Esperando archivo...</div>
+</div>
+<div class="box">
+  <b>2.</b> Descarga los paquetes y ponlos junto a <code>index.html</code>:
+  <div id="out"></div>
+</div>
+
+<script src="assets.js"></script>
+<script>
+'use strict';
+const PART_SIZE = 24 * 1000 * 1000;          // < 25 MiB (GitHub web upload limit)
+const logEl = document.getElementById('log'), barEl = document.querySelector('#bar div'), outEl = document.getElementById('out');
+const log = (t, cls) => { const s = document.createElement('div'); if (cls) s.className = cls; s.textContent = t; logEl.appendChild(s); };
+const progress = p => { barEl.style.width = (p * 100).toFixed(1) + '%'; };
+const tick = () => new Promise(r => setTimeout(r, 0));
+const NEEDED = neededFiles();
+
+// match an archive/folder path to a needed path (works whatever the outer folder names are)
+function matchNeeded(path) {
+  path = path.replace(/\\/g, '/');
+  for (const n of NEEDED) if (path === n || path.endsWith('/' + n)) return n;
+  return null;
+}
+
+// ---------------------------------------------------------------- RAR5 reader (store + LZ, non-solid)
+function vint(b, p) { let r = 0, s = 0; for (;;) { const c = b[p++]; r += (c & 0x7f) * 2 ** s; s += 7; if (!(c & 0x80)) return [r, p]; } }
+const u32 = (b, p) => (b[p] | (b[p + 1] << 8) | (b[p + 2] << 16) | (b[p + 3] << 24)) >>> 0;
+const w32 = (b, p, v) => { b[p] = v & 255; b[p + 1] = (v >>> 8) & 255; b[p + 2] = (v >>> 16) & 255; b[p + 3] = (v >>> 24) & 255; };
+function* walkRar(buf) {
+  const sig = String.fromCharCode(...buf.subarray(0, 8));
+  if (sig === 'Rar!\x1a\x07\x00' + String.fromCharCode(buf[7])) throw new Error('Este .rar es formato RAR4 (antiguo). Descomprímelo y usa "Elegir la carpeta".');
+  if (sig !== 'Rar!\x1a\x07\x01\x00') throw new Error('No es un archivo RAR válido.');
+  const td = new TextDecoder();
+  let pos = 8;
+  while (pos < buf.length) {
+    let [hsize, p] = vint(buf, pos + 4);
+    const hdrEnd = p + hsize; let q = p, htype, hflags, extra = 0, dsize = 0;
+    [htype, q] = vint(buf, q); [hflags, q] = vint(buf, q);
+    if (hflags & 1) [extra, q] = vint(buf, q);
+    if (hflags & 2) [dsize, q] = vint(buf, q);
+    const e = { type: htype, dataOff: hdrEnd, dsize };
+    if (htype === 4) throw new Error('El .rar está protegido con contraseña. Descomprímelo y usa "Elegir la carpeta".');
+    if (htype === 2) {
+      let ff, usize, attr, comp, hos, nl;
+      [ff, q] = vint(buf, q); [usize, q] = vint(buf, q); [attr, q] = vint(buf, q);
+      if (ff & 2) q += 4;
+      let crc = null; if (ff & 4) { crc = u32(buf, q); q += 4; }
+      [comp, q] = vint(buf, q); [hos, q] = vint(buf, q); [nl, q] = vint(buf, q);
+      Object.assign(e, { name: td.decode(buf.subarray(q, q + nl)), usize, isdir: !!(ff & 1), method: (comp >> 7) & 7, ver: comp & 0x3f, solid: !!(comp & 0x40), crc });
+    }
+    yield e;
+    if (htype === 5) break;
+    pos = hdrEnd + dsize;
+  }
+}
+class Bits {
+  constructor(b) { this.b = b; this.addr = 0; this.bit = 0; }
+  get16() { const b = this.b, a = this.addr; return ((((b[a] | 0) << 16) | ((b[a + 1] | 0) << 8) | (b[a + 2] | 0)) >>> (8 - this.bit)) & 0xffff; }
+  get32() { const b = this.b, a = this.addr;
+    let v = (b[a] | 0) * 16777216 + ((b[a + 1] | 0) << 16) + ((b[a + 2] | 0) << 8) + (b[a + 3] | 0);
+    v = (v * 2 ** this.bit) % 4294967296; v += ((b[a + 4] | 0) >>> (8 - this.bit)); return v >>> 0; }
+  add(n) { n += this.bit; this.addr += n >> 3; this.bit = n & 7; }
+}
+function makeTable(lens, off, n) {
+  const t = new Int32Array(1 << 15).fill(-1), cnt = new Int32Array(16);
+  for (let i = 0; i < n; i++) cnt[lens[off + i] & 15]++;
+  cnt[0] = 0; const next = new Int32Array(16); let code = 0;
+  for (let l = 1; l < 16; l++) { code = (code + cnt[l - 1]) << 1; next[l] = code; }
+  for (let i = 0; i < n; i++) { const l = lens[off + i] & 15; if (!l) continue;
+    const c = next[l]++, start = c << (15 - l), end = (c + 1) << (15 - l), v = i | (l << 16);
+    for (let k = start; k < end && k < 32768; k++) t[k] = v; }
+  return t;
+}
+function dec(inp, t) { const v = t[inp.get16() >>> 1]; if (v < 0) throw new Error('datos RAR dañados'); inp.add(v >>> 16); return v & 0xffff; }
+function unpack5(src, usize, ver) {
+  const NC = 306, DC = ver === 1 ? 80 : 64, LDC = 16, RC = 44, TSIZE = NC + DC + LDC + RC;
+  const out = new Uint8Array(usize); let op = 0;
+  const inp = new Bits(src), filters = [];
+  let blk = null, LD, DD, LDD, RD; const oldDist = [0, 0, 0, 0]; let lastLen = 0;
+  function readHeader() {
+    inp.add((8 - inp.bit) & 7);
+    const flags = inp.get16() >>> 8; inp.add(8);
+    const bc = ((flags >> 3) & 3) + 1; if (bc === 4) throw new Error('bloque RAR inválido');
+    const bitSize = (flags & 7) + 1; inp.add(8);
+    let size = 0; for (let i = 0; i < bc; i++) { size += (inp.get16() >>> 8) << (i * 8); inp.add(8); }
+    blk = { start: inp.addr, size, bitSize, last: !!(flags & 0x40), table: !!(flags & 0x80) };
+  }
+  function readTables() {
+    if (!blk.table) return;
+    const bl = new Uint8Array(20);
+    for (let i = 0; i < 20; i++) {
+      const len = inp.get16() >>> 12; inp.add(4);
+      if (len === 15) { let z = inp.get16() >>> 12; inp.add(4); if (z === 0) bl[i] = 15; else { z += 2; while (z-- > 0 && i < 20) bl[i++] = 0; i--; } }
+      else bl[i] = len;
+    }
+    const BD = makeTable(bl, 0, 20), tb = new Uint8Array(TSIZE);
+    for (let i = 0; i < TSIZE;) {
+      const num = dec(inp, BD);
+      if (num < 16) tb[i++] = num;
+      else if (num < 18) { let n; if (num === 16) { n = (inp.get16() >>> 13) + 3; inp.add(3); } else { n = (inp.get16() >>> 9) + 11; inp.add(7); } while (n-- > 0 && i < TSIZE) { tb[i] = tb[i - 1]; i++; } }
+      else { let n; if (num === 18) { n = (inp.get16() >>> 13) + 3; inp.add(3); } else { n = (inp.get16() >>> 9) + 11; inp.add(7); } while (n-- > 0 && i < TSIZE) tb[i++] = 0; }
+    }
+    LD = makeTable(tb, 0, NC); DD = makeTable(tb, NC, DC); LDD = makeTable(tb, NC + DC, LDC); RD = makeTable(tb, NC + DC + LDC, RC);
+  }
+  function slotToLen(slot) { let lb, len = 2; if (slot < 8) { lb = 0; len += slot; } else { lb = (slot >> 2) - 1; len += (4 | (slot & 3)) << lb; } if (lb > 0) { len += inp.get16() >>> (16 - lb); inp.add(lb); } return len; }
+  function copy(len, dist) { let s = op - dist; if (s < 0) throw new Error('distancia RAR inválida'); while (len-- > 0 && op < usize) out[op++] = out[s++]; }
+  function filterData() { const bc = (inp.get16() >>> 14) + 1; inp.add(2); let d = 0; for (let i = 0; i < bc; i++) { d += (inp.get16() >>> 8) * 2 ** (i * 8); inp.add(8); } return d; }
+  readHeader(); readTables();
+  while (op < usize) {
+    const end = blk.start + blk.size - 1;
+    if (inp.addr > end || (inp.addr === end && inp.bit >= blk.bitSize)) { if (blk.last) break; readHeader(); readTables(); continue; }
+    const ms = dec(inp, LD);
+    if (ms < 256) { out[op++] = ms; continue; }
+    if (ms >= 262) {
+      let len = slotToLen(ms - 262), dist = 1, db; const ds = dec(inp, DD);
+      if (ds < 4) { db = 0; dist += ds; } else { db = (ds >> 1) - 1; dist += (2 | (ds & 1)) * 2 ** db; }
+      if (db > 0) {
+        if (db >= 4) { if (db > 4) { dist += Math.floor(inp.get32() / 2 ** (36 - db)) * 16; inp.add(db - 4); } dist += dec(inp, LDD); }
+        else { dist += inp.get32() >>> (32 - db); inp.add(db); }
+      }
+      if (dist > 0x100) { len++; if (dist > 0x2000) { len++; if (dist > 0x40000) len++; } }
+      oldDist.unshift(dist); oldDist.length = 4; lastLen = len; copy(len, dist); continue;
+    }
+    if (ms === 256) { const st = filterData(), ln = filterData(), type = inp.get16() >>> 13; inp.add(3);
+      let ch = 0; if (type === 0) { ch = (inp.get16() >>> 11) + 1; inp.add(5); }
+      filters.push({ start: op + st, len: ln, type, ch }); continue; }
+    if (ms === 257) { if (lastLen) copy(lastLen, oldDist[0]); continue; }
+    const dn = ms - 258, dist = oldDist[dn]; oldDist.splice(dn, 1); oldDist.unshift(dist);
+    const len = slotToLen(dec(inp, RD)); lastLen = len; copy(len, dist);
+  }
+  for (const f of filters) {
+    const d = out.subarray(f.start, f.start + f.len), n = d.length;
+    if (f.type === 0) { const src = d.slice(); let sp = 0;
+      for (let c = 0; c < f.ch; c++) { let prev = 0; for (let p = c; p < n; p += f.ch) { prev = (prev - src[sp++]) & 0xff; d[p] = prev; } } }
+    else if (f.type === 1 || f.type === 2) { const FS = 0x1000000, cmp2 = f.type === 2 ? 0xe9 : 0xe8;
+      for (let cp = 0; cp + 4 < n;) { const cb = d[cp++];
+        if (cb === 0xe8 || cb === cmp2) { const off = (cp + f.start) % FS, addr = u32(d, cp);
+          if (addr & 0x80000000) { if (!(((addr + off) >>> 0) & 0x80000000)) w32(d, cp, (addr + FS) >>> 0); }
+          else if (((addr - FS) >>> 0) & 0x80000000) w32(d, cp, (addr - off) >>> 0);
+          cp += 4; } } }
+    else if (f.type === 3) { for (let cp = 0; cp + 3 < n; cp += 4) if (d[cp + 3] === 0xeb) {
+      let o = d[cp] + d[cp + 1] * 256 + d[cp + 2] * 65536; o = (o - ((f.start + cp) >>> 2)) >>> 0;
+      d[cp] = o & 255; d[cp + 1] = (o >> 8) & 255; d[cp + 2] = (o >> 16) & 255; } }
+  }
+  return out;
+}
+const CRC_T = (() => { const t = new Int32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c; } return t; })();
+function crc32(b) { let c = -1; for (let i = 0; i < b.length; i++) c = CRC_T[(c ^ b[i]) & 255] ^ (c >>> 8); return (c ^ -1) >>> 0; }
+
+// ---------------------------------------------------------------- collect files
+async function fromRar(file) {
+  log('Leyendo ' + file.name + ' (' + (file.size / 1048576).toFixed(0) + ' MB)...');
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const entries = [...walkRar(buf)].filter(e => e.type === 2 && !e.isdir);
+  const found = new Map(); let i = 0;
+  for (const e of entries) {
+    i++; progress(i / entries.length * 0.8);
+    const need = matchNeeded(e.name); if (!need || found.has(need)) continue;
+    if (e.solid) throw new Error('El .rar es "sólido". Descomprímelo y usa "Elegir la carpeta".');
+    const data = buf.subarray(e.dataOff, e.dataOff + e.dsize);
+    const bytes = e.method === 0 ? data.slice() : unpack5(data, e.usize, e.ver);
+    if (e.crc !== null && crc32(bytes) !== e.crc) throw new Error('Error de CRC en ' + e.name + ' (el .rar está dañado).');
+    found.set(need, bytes);
+    if (i % 10 === 0) { logEl.lastChild.textContent = 'Descomprimiendo... ' + i + '/' + entries.length; await tick(); }
+  }
+  return found;
+}
+async function fromFolder(files) {
+  const found = new Map(); let i = 0;
+  for (const f of files) {
+    i++; progress(i / files.length * 0.8);
+    const need = matchNeeded(f.webkitRelativePath || f.name); if (!need || found.has(need)) continue;
+    found.set(need, new Uint8Array(await f.arrayBuffer()));
+    if (i % 20 === 0) await tick();
+  }
+  return found;
+}
+
+// ---------------------------------------------------------------- build .pak parts
+function buildParts(found) {
+  const files = []; let off = 0;
+  for (const n of NEEDED) if (found.has(n)) { const b = found.get(n); files.push([n, off, b.length]); off += b.length; }
+  // header size depends on offsets, so compute it, then shift offsets
+  let header, hb, base = 0;
+  for (let k = 0; k < 3; k++) {
+    const shifted = files.map(([n, o, s]) => [n, o + base, s]);
+    const totalGuess = base + off;
+    header = { v: 1, parts: Math.ceil(totalGuess / PART_SIZE), total: totalGuess, files: shifted };
+    hb = new TextEncoder().encode(JSON.stringify(header));
+    const nb = 12 + hb.length; if (nb === base) break; base = nb;
+  }
+  const pre = new Uint8Array(12); pre.set([...'FNAFPAK1'].map(c => c.charCodeAt(0))); new DataView(pre.buffer).setUint32(8, hb.length, true);
+  const stream = new Blob([pre, hb, ...files.map(([n]) => found.get(n))]);
+  if (stream.size !== header.total) throw new Error('tamaño inesperado');
+  const parts = [];
+  for (let i = 0; i < header.parts; i++) parts.push(stream.slice(i * PART_SIZE, Math.min(stream.size, (i + 1) * PART_SIZE), 'application/octet-stream'));
+  return parts;
+}
+
+async function run(getFound) {
+  logEl.textContent = ''; outEl.textContent = ''; progress(0);
+  try {
+    const found = await getFound();
+    const miss = NEEDED.filter(n => !found.has(n));
+    log('Archivos encontrados: ' + found.size + ' de ' + NEEDED.length, miss.length ? 'err' : 'ok');
+    if (miss.length) { log('Faltan:\n  ' + miss.slice(0, 15).join('\n  ') + (miss.length > 15 ? '\n  ...' : ''), 'err'); if (found.size < NEEDED.length / 2) throw new Error('Faltan demasiados archivos. ¿Elegiste la carpeta correcta?'); log('Se empaqueta igual; el juego mostrará esos archivos como faltantes.'); }
+    const parts = buildParts(found); progress(1);
+    log('Listo: ' + parts.length + ' paquetes, ' + (parts.reduce((a, p) => a + p.size, 0) / 1048576).toFixed(1) + ' MB en total.', 'ok');
+    const all = document.createElement('button'); all.textContent = 'Descargar todos (' + parts.length + ')'; outEl.appendChild(all);
+    const links = parts.map((p, i) => { const a = document.createElement('a'); a.href = URL.createObjectURL(p); a.download = 'fnaf-assets-' + (i + 1) + '.pak';
+      a.textContent = '⬇ ' + a.download + ' (' + (p.size / 1048576).toFixed(1) + ' MB)'; outEl.appendChild(a); return a; });
+    all.onclick = async () => { for (const a of links) { a.click(); await new Promise(r => setTimeout(r, 700)); } };
+    log('Si el navegador pregunta si permites descargar varios archivos, acepta.');
+  } catch (e) { log('Error: ' + e.message, 'err'); console.error(e); }
+}
+document.getElementById('rar').onchange = e => { const f = e.target.files[0]; if (f) run(() => fromRar(f)); };
+document.getElementById('dir').onchange = e => { const fs = [...e.target.files]; if (fs.length) run(() => fromFolder(fs)); };
+</script>
+</body>
+</html>
